@@ -1,7 +1,7 @@
-# FlowSearch (for desktop)
+# FlowSearch Desktop
 
-A remote job search app that pulls listings from 10 job boards at once,
-then lets you search, filter, read job details, and save the
+A desktop job search app that pulls listings from 10 job boards at once,
+then lets you search, filter by location, read job details, and save the
 jobs you're interested in, all from one window. It's the desktop companion
 to the FlowSearch iOS app and uses the same sources and search rules.
 
@@ -10,12 +10,35 @@ It runs on macOS, Windows and Linux.
 
 ## Features
 
-- **10 job sources in one search.**
-- **Search with AND / OR / "phrases"**
-- **Location filter**
-- **Job details** 
-- **Saved jobs.**
+- **10 job sources in one search.** All selected sources are fetched in
+  parallel, and results appear as each source finishes, so you can start
+  browsing in about a second while slower sources keep loading. Duplicate
+  postings are removed.
+- **Search with AND / OR / "phrases"** across title, company and location.
+- **Location filter** for jobs within 25 miles of a place, or type `remote`
+  for remote jobs only.
+- **Job details panel.** Select a job to see its employment type, salary,
+  and key requirements (or a short summary), with a button to open the
+  full posting.
+- **Saved jobs.** Save postings to a list that's kept on your computer
+  between sessions.
 
+## Job sources
+
+| Source | How it's fetched | Notes |
+|---|---|---|
+| [VibeCode Careers](https://vibecodecareers.com/jobs/) | HTML pages | Every page (~1,500 jobs). Takes ~6 minutes; see [Limitations](#limitations) |
+| [We Work Remotely](https://weworkremotely.com) | RSS feed | |
+| [RemoteOK](https://remoteok.com) | JSON API | |
+| [Himalayas](https://himalayas.app) | JSON API | 20 listings per search; expired listings skipped |
+| [Remotive](https://remotive.com) | JSON API | Employment type; salary on many listings |
+| [Jobicy](https://jobicy.com) | JSON API | Employment type; salary range on many listings |
+| [Working Nomads](https://www.workingnomads.com) | JSON API | |
+| [Arbeitnow](https://www.arbeitnow.com) | JSON API | Mostly European listings, remote and on-site |
+| [The Muse](https://www.themuse.com) | JSON API | First page only; includes on-site roles |
+| [Jobspresso](https://jobspresso.co) | RSS feed | |
+
+All of these are public feeds or pages. No API keys or accounts are needed.
 
 ## Getting started
 
@@ -43,6 +66,29 @@ python3 job_scraper_gui.py
 4. Click **Save Job** to keep it. Switch to **Saved Jobs** above the table
    to see everything you've saved.
 
+### Search syntax
+
+| You type | Matches jobs containing |
+|---|---|
+| `python developer` | both words, anywhere (AND is implied) |
+| `python AND remote` | both terms |
+| `python OR java` | either term |
+| `"data engineer"` | that exact phrase |
+| `python OR "data engineer"` | `python`, or the exact phrase |
+
+Search is case-insensitive and looks at each job's title, company and location.
+
+### Location
+
+- Enter a place (e.g. `Buffalo, NY`) to see jobs within **25 miles**. Jobs
+  without a recognizable location, like "Remote" or "Worldwide", are left out.
+- Enter `remote` to see only remote jobs.
+
+Places are looked up with OpenStreetMap's free
+[Nominatim](https://nominatim.org) service, which allows about one lookup
+per second. The first location filter after a big search can take a few
+minutes while every job's location is looked up. Lookups are remembered
+until the app closes.
 
 ### Saved jobs
 
@@ -58,6 +104,23 @@ data folder:
 The Saved Jobs view lists everything you've saved, newest first. The
 Search and Location filters only apply to search results.
 
+## Limitations
+
+- **VibeCode Careers is slow.** It has no API and allows only about 30
+  page requests a minute, so reading all ~150 pages takes around 6
+  minutes. Its jobs arrive after the other sources and include only title,
+  company and location.
+- **Some sources return only part of their catalog** (Himalayas, The
+  Muse: one page each), since their full catalogs run into the tens or hundreds of
+  thousands.
+- **Job details depend on the source.** Not every posting has a salary or
+  a recognizable requirements section.
+- **Saved jobs stay on this computer.** Syncing them with the FlowSearch
+  iOS app through an account isn't supported yet.
+- **Sites can change.** Sources are third-party sites; if one changes its
+  feed or page layout, that source may stop returning jobs until the
+  scraper is updated.
+
 ## Building a standalone app
 
 To build an app that runs without Python installed:
@@ -71,3 +134,13 @@ The app is created under `dist/` for the OS you build on (a `.app` on
 macOS, an `.exe` on Windows). PyInstaller doesn't cross-compile, so build
 on each OS you want to support. On macOS the app is unsigned: open it the
 first time with right-click → **Open**, or Gatekeeper will block it.
+
+## Project structure
+
+| File | What it does |
+|---|---|
+| `job_scraper_gui.py` | The app window: search bar, results table, details panel, saved jobs view |
+| `scraper.py` | One fetcher per job source, plus the shared `JobPosting` model |
+| `job_description.py` | Pulls requirements or a summary out of a posting's description |
+| `saved_jobs.py` | Reads and writes the saved jobs file |
+| `geocoding.py` | Location lookups (Nominatim) and distance calculation |

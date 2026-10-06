@@ -1,9 +1,12 @@
 import re
+import time
 import requests
 from bs4 import BeautifulSoup
 from dataclasses import dataclass
 from urllib.parse import urljoin, urlparse
 from xml.etree import ElementTree
+
+from job_description import highlights
 
 HEADERS = {
     "User-Agent": (
@@ -36,6 +39,20 @@ CTA_MARKERS = ["view job", "apply now", "apply", "read more", "see details", "vi
 IGNORE_LINE_WORDS = {"save", "share", "view job", "apply", "apply now", "read more"}
 
 
+def _repair_mojibake(text: str) -> str:
+    """Some sources' feeds have already mangled their own UTF-8 text by the
+    time it reaches us -- misreading it as Latin-1 upstream and re-encoding
+    that, which turns e.g. "á" into "Ã¡". Reversing the same misreading
+    (treat each character as a Latin-1 byte, then decode those bytes as
+    UTF-8) restores the original. Correctly-encoded text almost never
+    survives that round-trip as valid UTF-8, so it's left unchanged rather
+    than corrupted."""
+    try:
+        return text.encode("latin-1").decode("utf-8")
+    except UnicodeError:
+        return text
+
+
 @dataclass
 class JobPosting:
     title: str
@@ -43,6 +60,39 @@ class JobPosting:
     location: str
     work_type: str  # "Remote" | "Hybrid" | "On-site" | "Unknown"
     url: str
+    # Full-time/part-time/contract, when the source lists it.
+    employment_type: "str | None" = None
+    # Free-text pay range, when the source lists it.
+    salary_range: "str | None" = None
+    # Up to 5 bullet points pulled from under a "Requirements"/"Qualifications"-
+    # style heading in the full listing, when one could be found (see
+    # job_description.highlights).
+    requirements: "list[str] | None" = None
+    # Short plain-text blurb about the role, shown in place of `requirements`
+    # when no such heading was found.
+    summary: "str | None" = None
+
+    def __post_init__(self):
+        # Repair before truncating, so a cut can't land partway through a
+        # garbled multi-byte sequence and leave it unrepairable.
+        self.title = _repair_mojibake(self.title or "")[:140]
+        self.company = _repair_mojibake(self.company or "")[:80]
+        self.location = _repair_mojibake(self.location or "")[:80]
+        self.employment_type = _optional_text(self.employment_type, 40)
+        self.salary_range = _optional_text(self.salary_range, 60)
+        self.summary = _optional_text(self.summary, 280)
+        if self.requirements:
+            repaired = [_optional_text(r, 120) for r in self.requirements]
+            self.requirements = [r for r in repaired if r][:5] or None
+        else:
+            self.requirements = None
+
+
+def _optional_text(text: "str | None", limit: int) -> "str | None":
+    """Repaired and truncated `text`, or None when there's nothing to show."""
+    if not text or not str(text).strip():
+        return None
+    return _repair_mojibake(str(text).strip())[:limit]
 
 
 def _classify_work_type(text: str) -> str:
@@ -113,15 +163,39 @@ def _extract_from_card(card, title: str, href: str) -> JobPosting:
 
     work_type = _classify_work_type(card.get_text(" ", strip=True))
     return JobPosting(
-        title=title[:140], company=company[:80], location=location[:80],
+        title=title, company=company, location=location,
         work_type=work_type, url=href,
     )
 
 
-def _fetch_page_jobs(url: str, timeout: int) -> tuple[list[JobPosting], BeautifulSoup]:
-    resp = requests.get(url, headers=HEADERS, timeout=timeout)
+# Paginated HTML boards (VibeCode Careers) rate-limit page requests to
+# about 30 a minute, answering anything past that with a 429 (and no
+# Retry-After header) until the minute rolls over. Pacing requests evenly
+# would be slower than fetching ~30 pages at full speed and then waiting
+# out the block, so the crawl does the latter: on a 429 it re-checks every
+# _RATE_LIMIT_BACKOFF seconds and resumes from the same page, rather than
+# treating the block as the end of the list.
+_RATE_LIMIT_BACKOFF = 15
+_MAX_RATE_LIMIT_RETRIES = 8  # ~2 minutes of waiting before giving up on a page
+# Safety cap so a site with a pagination loop can't keep us fetching forever.
+_MAX_HTML_PAGES = 500
+
+
+def _get_page(session: requests.Session, url: str, timeout: int) -> str:
+    """GET `url`, waiting out and retrying 429 responses."""
+    for attempt in range(_MAX_RATE_LIMIT_RETRIES + 1):
+        resp = session.get(url, timeout=timeout)
+        if resp.status_code != 429 or attempt == _MAX_RATE_LIMIT_RETRIES:
+            break
+        retry_after = resp.headers.get("Retry-After", "")
+        wait = float(retry_after) if retry_after.isdigit() else _RATE_LIMIT_BACKOFF
+        time.sleep(min(max(wait, 1), 60))
     resp.raise_for_status()
-    soup = BeautifulSoup(resp.text, "html.parser")
+    return resp.text
+
+
+def _parse_page_jobs(html: str, url: str) -> tuple[list[JobPosting], BeautifulSoup]:
+    soup = BeautifulSoup(html, "html.parser")
 
     # --- primary strategy: job-detail-link based ---
     best_anchor_for_href: dict[str, object] = {}
@@ -178,6 +252,13 @@ def _fetch_page_jobs(url: str, timeout: int) -> tuple[list[JobPosting], Beautifu
     return postings, soup
 
 
+def _highlight_fields(description: "str | None", excerpt: "str | None" = None) -> dict:
+    """JobPosting keyword args for a posting's requirements/summary, pulled
+    from its full description (see job_description.highlights)."""
+    requirements, summary = highlights(description, excerpt)
+    return {"requirements": requirements, "summary": summary}
+
+
 def _fetch_remoteok_jobs(url: str, timeout: int) -> list[JobPosting]:
     resp = requests.get(url, headers=HEADERS, timeout=timeout)
     resp.raise_for_status()
@@ -191,11 +272,12 @@ def _fetch_remoteok_jobs(url: str, timeout: int) -> list[JobPosting]:
         work_type = _classify_work_type(f"{location} {' '.join(entry.get('tags', []))}")
         postings.append(
             JobPosting(
-                title=title[:140],
-                company=entry.get("company", "")[:80],
-                location=location[:80],
+                title=title,
+                company=entry.get("company", ""),
+                location=location,
                 work_type="Remote" if work_type == "Unknown" else work_type,
                 url=job_url,
+                **_highlight_fields(entry.get("description")),
             )
         )
     return postings
@@ -212,11 +294,15 @@ def _fetch_remotive_jobs(url: str, timeout: int) -> list[JobPosting]:
             continue
         postings.append(
             JobPosting(
-                title=title[:140],
-                company=entry.get("company_name", "")[:80],
-                location=(entry.get("candidate_required_location") or "Remote")[:80],
+                title=title,
+                company=entry.get("company_name", ""),
+                location=(entry.get("candidate_required_location") or "Remote"),
                 work_type="Remote",
                 url=job_url,
+                # e.g. "full_time" -> "Full-Time"
+                employment_type=(entry.get("job_type") or "").replace("_", "-").title(),
+                salary_range=entry.get("salary"),
+                **_highlight_fields(entry.get("description")),
             )
         )
     return postings
@@ -238,11 +324,196 @@ def _fetch_wwr_rss_jobs(url: str, timeout: int) -> list[JobPosting]:
         work_type = _classify_work_type(region)
         postings.append(
             JobPosting(
-                title=job_title[:140],
-                company=company[:80],
-                location=region[:80],
+                title=job_title,
+                company=company,
+                location=region,
                 work_type="Remote" if work_type == "Unknown" else work_type,
                 url=link,
+                **_highlight_fields(item.findtext("description")),
+            )
+        )
+    return postings
+
+
+_JOBSPRESSO_NS = "{https://jobspresso.co}"
+
+
+def _fetch_jobspresso_rss_jobs(url: str, timeout: int) -> list[JobPosting]:
+    """Jobspresso's feed carries company/location as their own custom
+    `job_listing:*` tags, rather than a combined "Company: Title" line the
+    way We Work Remotely's does."""
+    resp = requests.get(url, headers=HEADERS, timeout=timeout)
+    resp.raise_for_status()
+    root = ElementTree.fromstring(resp.content)
+    postings = []
+    for item in root.findall(".//item"):
+        title = (item.findtext("title") or "").strip()
+        link = (item.findtext("link") or item.findtext("guid") or "").strip()
+        if not title or not link:
+            continue
+        location = (item.findtext(f"{_JOBSPRESSO_NS}location") or "").strip()
+        work_type = _classify_work_type(location)
+        postings.append(
+            JobPosting(
+                title=title,
+                company=(item.findtext(f"{_JOBSPRESSO_NS}company") or "").strip(),
+                location=location,
+                # Jobspresso only lists remote roles, so an unrecognized location never means on-site.
+                work_type="Remote" if work_type == "Unknown" else work_type,
+                url=link,
+                # Despite the name, the feed's job_category tag holds the
+                # employment type ("Full Time"); job_type holds the role area.
+                employment_type=item.findtext(f"{_JOBSPRESSO_NS}job_category"),
+                **_highlight_fields(item.findtext("description")),
+            )
+        )
+    return postings
+
+
+def _fetch_himalayas_jobs(url: str, timeout: int) -> list[JobPosting]:
+    """Himalayas caps this at 20 results per request regardless of the limit
+    requested; a single page is plenty anyway, since the full feed runs into
+    the tens of thousands of listings."""
+    resp = requests.get(url, headers=HEADERS, params={"limit": 100}, timeout=timeout)
+    resp.raise_for_status()
+    now = time.time()
+    postings = []
+    for entry in resp.json().get("jobs", []):
+        # `guid` is the listing's own page on himalayas.app; `applicationLink`
+        # often points off-site instead, so guid is the more stable link.
+        title = entry.get("title") or ""
+        job_url = entry.get("guid") or ""
+        if not title or not job_url:
+            continue
+        # Himalayas is the one source that says when a listing expires, so
+        # skip anything already past it that the feed just hasn't pruned yet.
+        expiry = entry.get("expiryDate")
+        if isinstance(expiry, (int, float)) and expiry < now:
+            continue
+        location = next((loc for loc in entry.get("locationRestrictions") or [] if loc), "Remote")
+        work_type = _classify_work_type(location)
+        postings.append(
+            JobPosting(
+                title=title,
+                company=(entry.get("companyName") or ""),
+                location=location,
+                work_type="Remote" if work_type == "Unknown" else work_type,
+                url=job_url,
+                **_highlight_fields(entry.get("description"), entry.get("excerpt")),
+            )
+        )
+    return postings
+
+
+def _jobicy_salary(entry: dict) -> "str | None":
+    """e.g. "90000-120000 USD", when Jobicy lists a pay range."""
+    try:
+        low, high = float(entry["salaryMin"]), float(entry["salaryMax"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if high <= 0:
+        return None
+    return f"{int(low)}-{int(high)} {entry.get('salaryCurrency') or ''}".strip()
+
+
+def _fetch_jobicy_jobs(url: str, timeout: int) -> list[JobPosting]:
+    resp = requests.get(url, headers=HEADERS, timeout=timeout)
+    resp.raise_for_status()
+    postings = []
+    for entry in resp.json().get("jobs", []):
+        title = entry.get("jobTitle") or ""
+        job_url = entry.get("url") or ""
+        if not title or not job_url:
+            continue
+        location = entry.get("jobGeo") or "Remote"
+        work_type = _classify_work_type(location)
+        postings.append(
+            JobPosting(
+                title=title,
+                company=(entry.get("companyName") or ""),
+                location=location,
+                # Jobicy only lists remote roles, so an unrecognized location never means on-site.
+                work_type="Remote" if work_type == "Unknown" else work_type,
+                url=job_url,
+                employment_type=next(iter(entry.get("jobType") or []), None),
+                salary_range=_jobicy_salary(entry),
+                **_highlight_fields(entry.get("jobDescription"), entry.get("jobExcerpt")),
+            )
+        )
+    return postings
+
+
+def _fetch_working_nomads_jobs(url: str, timeout: int) -> list[JobPosting]:
+    resp = requests.get(url, headers=HEADERS, timeout=timeout)
+    resp.raise_for_status()
+    postings = []
+    for entry in resp.json():
+        title = entry.get("title") or ""
+        job_url = entry.get("url") or ""
+        if not title or not job_url:
+            continue
+        location = entry.get("location") or "Remote"
+        work_type = _classify_work_type(f"{location} {entry.get('tags') or ''}")
+        postings.append(
+            JobPosting(
+                title=title,
+                company=(entry.get("company_name") or ""),
+                location=location,
+                work_type="Remote" if work_type == "Unknown" else work_type,
+                url=job_url,
+                **_highlight_fields(entry.get("description")),
+            )
+        )
+    return postings
+
+
+def _fetch_arbeitnow_jobs(url: str, timeout: int) -> list[JobPosting]:
+    resp = requests.get(url, headers=HEADERS, timeout=timeout)
+    resp.raise_for_status()
+    postings = []
+    for entry in resp.json().get("data", []):
+        title = entry.get("title") or ""
+        job_url = entry.get("url") or ""
+        if not title or not job_url:
+            continue
+        location = entry.get("location") or "Remote"
+        postings.append(
+            JobPosting(
+                title=title,
+                company=(entry.get("company_name") or ""),
+                location=location,
+                work_type="Remote" if entry.get("remote") else _classify_work_type(location),
+                url=job_url,
+                employment_type=next(iter(entry.get("job_types") or []), None),
+                **_highlight_fields(entry.get("description")),
+            )
+        )
+    return postings
+
+
+def _fetch_the_muse_jobs(url: str, timeout: int) -> list[JobPosting]:
+    """Unlike the other JSON sources, The Muse is a general job board
+    (on-site roles included, not remote-only), so an unrecognized location
+    isn't nudged towards "Remote". Only the first page is fetched -- the
+    catalog runs into the hundreds of thousands of listings."""
+    resp = requests.get(url, headers=HEADERS, timeout=timeout)
+    resp.raise_for_status()
+    postings = []
+    for entry in resp.json().get("results", []):
+        title = entry.get("name") or ""
+        job_url = (entry.get("refs") or {}).get("landing_page") or ""
+        if not title or not job_url:
+            continue
+        locations = entry.get("locations") or []
+        location = (locations[0].get("name") if locations else "") or "Remote"
+        postings.append(
+            JobPosting(
+                title=title,
+                company=((entry.get("company") or {}).get("name") or ""),
+                location=location,
+                work_type=_classify_work_type(location),
+                url=job_url,
+                **_highlight_fields(entry.get("contents")),
             )
         )
     return postings
@@ -263,6 +534,12 @@ _SINGLE_CALL_FETCHERS = {
     "remoteok.com": _fetch_remoteok_jobs,
     "remotive.com": _fetch_remotive_jobs,
     "weworkremotely.com": _fetch_wwr_rss_jobs,
+    "jobspresso.co": _fetch_jobspresso_rss_jobs,
+    "himalayas.app": _fetch_himalayas_jobs,
+    "jobicy.com": _fetch_jobicy_jobs,
+    "workingnomads.com": _fetch_working_nomads_jobs,
+    "arbeitnow.com": _fetch_arbeitnow_jobs,
+    "themuse.com": _fetch_the_muse_jobs,
 }
 
 
@@ -295,16 +572,24 @@ def fetch_jobs(
 
     all_postings: list[JobPosting] = []
     seen_urls: set = set()
+    visited_pages: set = set()
     next_url = url
     pages_fetched = 0
+    page_limit = _MAX_HTML_PAGES if max_pages is None else min(max_pages, _MAX_HTML_PAGES)
+    # One session for the whole crawl, so every page reuses the same
+    # connection instead of paying for a new TLS handshake each time.
+    session = requests.Session()
+    session.headers.update(HEADERS)
 
-    while next_url and (max_pages is None or pages_fetched < max_pages):
+    while next_url and next_url not in visited_pages and pages_fetched < page_limit:
+        visited_pages.add(next_url)
         try:
-            postings, soup = _fetch_page_jobs(next_url, timeout)
+            html = _get_page(session, next_url, timeout)
         except requests.RequestException:
             if pages_fetched == 0:
                 raise
             break
+        postings, soup = _parse_page_jobs(html, next_url)
 
         for job in postings:
             if job.url not in seen_urls:
@@ -312,8 +597,7 @@ def fetch_jobs(
                 all_postings.append(job)
 
         pages_fetched += 1
-        more_allowed = max_pages is None or pages_fetched < max_pages
-        next_url = _find_next_page_url(soup, next_url) if more_allowed else None
+        next_url = _find_next_page_url(soup, next_url) if pages_fetched < page_limit else None
 
     return all_postings
 
