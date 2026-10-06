@@ -23,23 +23,6 @@ It runs on macOS, Windows and Linux.
 - **Saved jobs.** Save postings to a list that's kept on your computer
   between sessions.
 
-## Job sources
-
-| Source | How it's fetched | Notes |
-|---|---|---|
-| [VibeCode Careers](https://vibecodecareers.com/jobs/) | HTML pages | Every page (~1,500 jobs). Takes ~6 minutes; see [Limitations](#limitations) |
-| [We Work Remotely](https://weworkremotely.com) | RSS feed | |
-| [RemoteOK](https://remoteok.com) | JSON API | |
-| [Himalayas](https://himalayas.app) | JSON API | 20 listings per search; expired listings skipped |
-| [Remotive](https://remotive.com) | JSON API | Employment type; salary on many listings |
-| [Jobicy](https://jobicy.com) | JSON API | Employment type; salary range on many listings |
-| [Working Nomads](https://www.workingnomads.com) | JSON API | |
-| [Arbeitnow](https://www.arbeitnow.com) | JSON API | Mostly European listings, remote and on-site |
-| [The Muse](https://www.themuse.com) | JSON API | First page only; includes on-site roles |
-| [Jobspresso](https://jobspresso.co) | RSS feed | |
-
-All of these are public feeds or pages. No API keys or accounts are needed.
-
 ## Getting started
 
 **Requirements:** Python 3.10 or newer, with Tkinter. The python.org
